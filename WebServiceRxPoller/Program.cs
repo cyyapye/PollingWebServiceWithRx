@@ -9,135 +9,116 @@ using System.Reactive.Linq;
 using System.IO;
 using System.Threading;
 using System.Reactive.Concurrency;
+using ServiceStack.Text;
+using System.Diagnostics;
 
 namespace WebServiceRxPoller
 {
-  class Program
+
+  public static class DateTimeExtension
   {
-    public static readonly Func<int, TimeSpan> ExponentialBackoff = n => TimeSpan.FromSeconds( Math.Pow( n, 2 ) );
-
-    public struct RetryTuple<T>
+    public static TimeSpan ExponentialInterval( this TimeSpan interval, double power = 2 )
     {
-      public bool CanRetry;
-      public T Item;
-      public Exception Exception;
+      return new TimeSpan(
+        ( int ) Math.Pow( interval.Days, power ),
+        ( int ) Math.Pow( interval.Hours, power ),
+        ( int ) Math.Pow( interval.Minutes, power ),
+        ( int ) Math.Pow( interval.Seconds, power ),
+        ( int ) Math.Pow( interval.Milliseconds, power )
+        );
     }
+  }
 
-    static void Main( string[] args )
+  public static class ObservableExtension
+  {
+    public static IObservable<TSource> RetryWithBackOff<TSource, TException>(
+      this IObservable<TSource> source,
+      int retryLimit = 3,
+      Func<int /* retries */, TimeSpan /* interval */> getInterval = null,
+      Func<TException, bool> canRetry = null,
+      IScheduler scheduler = null
+    )
+      where TException : Exception
     {
-      var apiKey = Guid.NewGuid().ToString();
-      WebRequest peopleServiceRequest = HttpWebRequest.Create( "http://localhost/DummyService/people/" + apiKey );
-      peopleServiceRequest.Method = "GET";
-      ((HttpWebRequest) peopleServiceRequest).Accept = "application/xml";
+      Func<int, TimeSpan> squaredInterval =
+        ( retries ) => TimeSpan.FromSeconds( retries ).ExponentialInterval();
+      getInterval = getInterval ?? squaredInterval;
+      canRetry = canRetry == null ? ( error ) => true : canRetry;
+      scheduler = scheduler ?? Scheduler.ThreadPool;
 
-      var responseSource = Observable.Defer( () =>
+      Func<int, IObservable<TSource>> retry = null;
+      retry = ( retries ) => source.Catch<TSource, TException>( error =>
       {
-        return Observable.FromAsyncPattern<WebResponse>(
-          peopleServiceRequest.BeginGetResponse, peopleServiceRequest.EndGetResponse
-          )();
+        if ( !canRetry( error ) || retries >= retryLimit )
+          return Observable.Throw<TSource>( error );
+
+        return Observable
+          .Timer( getInterval( retries ), scheduler )
+          .SelectMany( retry( retries + 1 ) );
       } );
 
-      //var scheduler = new TestScheduler();
-      int attempt = 0;
-      var response = Observable.Defer( () =>
+      return retry( 0 );
+    }
+  }
+
+  public static class WebRequestObservable
+  {
+    public static IObservable<WebResponse> AsDeferredObservable( Func<WebRequest> webRequestFactory )
+    {
+      return Observable.Defer( () =>
       {
-        Console.WriteLine( "Attempt {0} at {1}", attempt, DateTime.Now.ToLongTimeString() );
-        return ( ( ++attempt == 1 ) 
-          ? responseSource 
-          //: responseSource.Delay( ExponentialBackoff( attempt - 1 ), Scheduler.ThreadPool )
-          : from i in Observable.Interval( ExponentialBackoff( attempt - 1 ) ).Timeout( ExponentialBackoff( attempt - 1 ) + TimeSpan.FromSeconds( 1 ) )
-            from r in responseSource
-            select r
-          ).Select( r => new RetryTuple<WebResponse> { CanRetry = true, Item = r, Exception = null } )
-          .Catch<RetryTuple<WebResponse>, Exception>( e =>
-            // e.Status == WebExceptionStatus.ProtocolError && ( ( HttpWebResponse ) e.Response ).StatusCode == HttpStatusCode.NotFound
-            e is WebException
-            ? Observable.Throw<RetryTuple<WebResponse>>( e )
-            : Observable.Return( new RetryTuple<WebResponse> { CanRetry = false, Item = default( WebResponse ), Exception = e } )
-          );
-      })
-        .Retry( 6 )
-        .SelectMany( r => r.CanRetry
-          ? Observable.Return( r.Item )
-          : Observable.Throw<WebResponse>( r.Exception )
-        );
+        var request = webRequestFactory();
+        return Observable.FromAsyncPattern<WebResponse>(
+          request.BeginGetResponse, request.EndGetResponse
+          )();
+      } );
+    }
+  }
 
-      //  return Observable.Defer( () =>
-      //  {
-      //    return ( ( ++attempt == 1 ) ? source : source.Delay( strategy( attempt - 1 ), scheduler ) )
-      //        .Select( item => new Tuple<bool, T, Exception>( true, item, null ) )
-      //        .Catch<Tuple<bool, T, Exception>, Exception>( e => retryOnError( e )
-      //            ? Observable.Throw<Tuple<bool, T, Exception>>( e )
-      //            : Observable.Return( new Tuple<bool, T, Exception>( false, default( T ), e ) ) );
-      //  } )
-      //  .Retry( retryCount )
-      //  .SelectMany( t => t.Item1
-      //      ? Observable.Return( t.Item2 )
-      //      : Observable.Throw<T>( t.Item3 ) );
+  class Program
+  {
+    static void Main( string[] args )
+    {
+      ITracer tracer = new ServiceStack.Text.Tracer.ConsoleTracer();
+      Stopwatch stopWatch = new Stopwatch();
 
-      //var response = from interval in Observable.Interval( TimeSpan.FromSeconds( 1 ) )
-      //                 .Timeout( TimeSpan.FromSeconds( 6 ) )
-      //               from r in responseSource()
-      //               //where ( ( HttpWebResponse ) r ).StatusCode == HttpStatusCode.OK
-      //               select r;
+      var apiKey = Guid.NewGuid().ToString();
+      var responseSource = WebRequestObservable.AsDeferredObservable( () =>
+        {
+          tracer.WriteDebug( "Retrying after {0} seconds...", stopWatch.ElapsedMilliseconds / 1000 );
+          WebRequest peopleServiceRequest = HttpWebRequest.Create( "http://localhost/DummyService/people/" + apiKey );
+          peopleServiceRequest.Method = "GET";
+          ( ( HttpWebRequest ) peopleServiceRequest ).Accept = "application/json";
+          return peopleServiceRequest;
+        } );
 
+      var response = responseSource.RetryWithBackOff<WebResponse, WebException>( 5 );
+
+      stopWatch.Start();
+      IList<Person> people = null;
       response
-        //.Catch<WebResponse, WebException>( e => response )
-        //.OnErrorResumeNext(responseSource())
         .Subscribe(
         r =>
         {
-          //if ( ( ( HttpWebResponse ) r ).StatusCode != HttpStatusCode.OK ) return;
-          using ( StreamReader sr = new StreamReader( r.GetResponseStream() ) )
-          {
-            Console.WriteLine( sr.ReadToEnd() );
-            Console.ReadLine();
-          }
+          people = JsonSerializer.DeserializeFromStream<Person[]>( r.GetResponseStream() );
         },
         Console.WriteLine,
-        () => { Console.WriteLine( "Completed." ); Console.ReadLine(); }
+        () =>
+        {
+          Console.WriteLine( "Completed." );
+          foreach ( var person in people )
+          {
+            person.PrintDump();
+          }
+          stopWatch.Stop();
+        }
       );
 
-      Console.WriteLine( "Back to main thread. Simulating work by sleeping for 8 seconds..." );
-      Thread.Sleep( 8000 );
+      Console.WriteLine( "Back to main thread. Simulating work by sleeping for 3 seconds..." );
+      Thread.Sleep( 3000 );
       Console.WriteLine( "Main thread done." );
-      //Console.ReadLine();
+
+      Console.ReadKey();
     }
-
-
-    // Licensed under the MIT license with <3 by GitHub
-
-    /// <summary>
-    /// An exponential back off strategy which starts with 1 second and then 4, 9, 16...
-    /// </summary>
-
-    //public static IObservable<T> RetryWithBackoffStrategy<T>(
-    //    this IObservable<T> source,
-    //    int retryCount = 3,
-    //    Func<int, TimeSpan> strategy = null,
-    //    Func<Exception, bool> retryOnError = null,
-    //    IScheduler scheduler = null )
-    //{
-    //  strategy = strategy ?? ExponentialBackoff;
-    //  scheduler = scheduler ?? Scheduler.ThreadPool;
-
-    //  if ( retryOnError == null )
-    //    retryOnError = e => e.CanRetry();
-
-    //  int attempt = 0;
-
-    //  return Observable.Defer( () =>
-    //  {
-    //    return ( ( ++attempt == 1 ) ? source : source.Delay( strategy( attempt - 1 ), scheduler ) )
-    //        .Select( item => new Tuple<bool, T, Exception>( true, item, null ) )
-    //        .Catch<Tuple<bool, T, Exception>, Exception>( e => retryOnError( e )
-    //            ? Observable.Throw<Tuple<bool, T, Exception>>( e )
-    //            : Observable.Return( new Tuple<bool, T, Exception>( false, default( T ), e ) ) );
-    //  } )
-    //  .Retry( retryCount )
-    //  .SelectMany( t => t.Item1
-    //      ? Observable.Return( t.Item2 )
-    //      : Observable.Throw<T>( t.Item3 ) );
-    //}
   }
 }

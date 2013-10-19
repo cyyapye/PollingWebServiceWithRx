@@ -15,7 +15,7 @@ using System.Diagnostics;
 namespace WebServiceRxPoller
 {
 
-  public static class DateTimeExtension
+  public static class TimeSpanExtension
   {
     public static TimeSpan ExponentialInterval( this TimeSpan interval, double power = 2 )
     {
@@ -35,7 +35,7 @@ namespace WebServiceRxPoller
       this IObservable<TSource> source,
       int retryLimit = 3,
       Func<int /* retries */, TimeSpan /* interval */> getInterval = null,
-      Func<TException, bool> canRetry = null,
+      Predicate<TException> canRetry = null,
       IScheduler scheduler = null
     )
       where TException : Exception
@@ -63,13 +63,14 @@ namespace WebServiceRxPoller
 
   public static class WebRequestObservable
   {
-    public static IObservable<WebResponse> AsDeferredObservable( Func<WebRequest> webRequestFactory )
+    public static IObservable<WebResponse> AsDeferredObservable( Uri uri, Action<WebRequest> webRequestConfigurator )
     {
       return Observable.Defer( () =>
       {
-        var request = webRequestFactory();
+        var request = WebRequest.Create( uri );
+        webRequestConfigurator( request );
         return Observable.FromAsyncPattern<WebResponse>(
-          request.BeginGetResponse, request.EndGetResponse
+            request.BeginGetResponse, request.EndGetResponse
           )();
       } );
     }
@@ -83,16 +84,21 @@ namespace WebServiceRxPoller
       Stopwatch stopWatch = new Stopwatch();
 
       var apiKey = Guid.NewGuid().ToString();
-      var responseSource = WebRequestObservable.AsDeferredObservable( () =>
+      var responseSource = WebRequestObservable.AsDeferredObservable(
+        new Uri( "http://localhost/DummyService/people/" + apiKey ),
+        ( webRequest ) =>
         {
           tracer.WriteDebug( "Retrying after {0} seconds...", stopWatch.ElapsedMilliseconds / 1000 );
-          WebRequest peopleServiceRequest = HttpWebRequest.Create( "http://localhost/DummyService/people/" + apiKey );
-          peopleServiceRequest.Method = "GET";
-          ( ( HttpWebRequest ) peopleServiceRequest ).Accept = "application/json";
-          return peopleServiceRequest;
+          webRequest.Method = "GET";
+          ( ( HttpWebRequest ) webRequest ).Accept = "application/json";
         } );
 
-      var response = responseSource.RetryWithBackOff<WebResponse, WebException>( 5 );
+      var response = responseSource.RetryWithBackOff<WebResponse, WebException>(
+        5,
+        retries => TimeSpan.FromSeconds( retries ).ExponentialInterval(),
+        exception => exception.IsNotFound(),
+        Scheduler.NewThread
+        );
 
       stopWatch.Start();
       IList<Person> people = null;

@@ -63,12 +63,12 @@ namespace WebServiceRxPoller
 
   public static class WebRequestObservable
   {
-    public static IObservable<WebResponse> AsDeferredObservable( Uri uri, Action<WebRequest> webRequestConfigurator )
+    public static IObservable<WebResponse> Create( Uri uri, Action<WebRequest> configure = null )
     {
       return Observable.Defer( () =>
       {
         var request = WebRequest.Create( uri );
-        webRequestConfigurator( request );
+        if ( configure != null ) configure( request );
         return Observable.FromAsyncPattern<WebResponse>(
             request.BeginGetResponse, request.EndGetResponse
           )();
@@ -84,7 +84,7 @@ namespace WebServiceRxPoller
       Stopwatch stopWatch = new Stopwatch();
 
       var apiKey = Guid.NewGuid().ToString();
-      var responseSource = WebRequestObservable.AsDeferredObservable(
+      var responseSource = WebRequestObservable.Create(
         new Uri( "http://localhost/DummyService/people/" + apiKey ),
         ( webRequest ) =>
         {

@@ -18,8 +18,10 @@ Heavily borrowed from Andreas Köpf [solution](http://social.msdn.microsoft.com/F
 * canRetry - A predicate to determine if you want to retry based on either the type of exception or other criteria.
 * scheduler - The observers run on the ThreadPool scheduler by default. You may choose a more suitable scheduler such as the TestScheduler when writing tests.
 
-### WebRequestObservable.AsDeferredObservable
-This is intended to enforce the creation of a cold observable on a new WebRequest with every retry. It is critical to ensure the WebRequest is created with every retry, otherwise reusing the same WebRequest results in the same response with every retry leading to exhaustion of retries up to the specified retryLimit. By taking control of the creation of the WebRequest, this eliminates the risk of mistakenly reusing the same WebRequest.
+### WebRequestObservable.Create
+This is intended to enforce the creation of a cold observable on a new WebRequest with every retry. It is critical to ensure the WebRequest is created with every retry, otherwise reusing the same WebRequest results in the same response with every retry leading to exhaustion of retries up to the specified retryLimit. By taking control of the creation of the WebRequest, this eliminates the risk of mistakenly reusing the same WebRequest. The Create method takes in the following parameters:
+* uri - Uri for the WebRequest.
+* configure - An optional action to further configure the WebRequest before passing it on to the observer.
 
 License
 =======
